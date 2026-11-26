@@ -12,4 +12,12 @@
 
 In a browser or WebDAV client, use your Worker’s HTTPS address and the credentials you set. The service path is `/`. The browser accepts individual files smaller than 100 MB.
 
+## Deploy updates from GitHub
+
+Connect the repository to the existing Worker under **Settings → Builds**. Use `main` as the production branch and turn off preview builds for this configuration. [Cloudflare Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/)
+
+The production build runs `npm run types && npm run typecheck && npm test`. After the checks pass, it uploads a Worker version and deploys that version to the existing domain with the Worker's stored secrets.
+
+## Test locally
+
 To verify a local instance with `npm run test:protocol`, keep `npm run dev` running. Set `WEBDAV_LARGE_MB=90` to include a 90 MiB round trip. The script creates and removes a temporary test directory.
