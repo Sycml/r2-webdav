@@ -9,35 +9,45 @@
  */
 
 import { DOMParser } from '@xmldom/xmldom';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { escapeXml, renderBrowserPage, type BrowserEntry } from './browser-page';
 
-export interface Env {
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	bucket: R2Bucket;
+// Env is generated from wrangler.jsonc and .dev.vars.example by `npm run types`.
 
-	// Variables defined in the "Environment Variables" section of the Wrangler CLI or dashboard
-	USERNAME: string;
-	PASSWORD: string;
+async function forEachBatched<T>(items: AsyncIterable<T>, operation: (item: T) => Promise<void>): Promise<void> {
+	let batch: T[] = [];
+	const flush = async () => {
+		const results = await Promise.allSettled(batch.map(operation));
+		batch = [];
+		const failed = results.find((result) => result.status === 'rejected');
+		if (failed?.status === 'rejected') throw failed.reason;
+	};
+	for await (const item of items) {
+		batch.push(item);
+		if (batch.length === 4) await flush();
+	}
+	if (batch.length > 0) await flush();
 }
 
-async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
-	let cursor: string | undefined = undefined;
-	do {
-		var r2_objects = await bucket.list({
-			prefix: prefix,
-			delimiter: isRecursive ? undefined : '/',
+async function* listPages(bucket: R2Bucket, prefix: string, delimiter?: string) {
+	let cursor: string | undefined;
+	for (;;) {
+		const page = await bucket.list({
+			prefix,
+			delimiter,
 			cursor: cursor,
-			// @ts-ignore https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#r2listoptions
 			include: ['httpMetadata', 'customMetadata'],
 		});
+		yield page;
+		if (!page.truncated) return;
+		cursor = page.cursor;
+	}
+}
 
-		for (let object of r2_objects.objects) {
-			yield object;
-		}
-
-		if (r2_objects.truncated) {
-			cursor = r2_objects.cursor;
-		}
-	} while (r2_objects.truncated);
+async function* listAll(bucket: R2Bucket, prefix: string, isRecursive = false) {
+	for await (const page of listPages(bucket, prefix, isRecursive ? undefined : '/')) {
+		yield* page.objects;
+	}
 }
 
 type DavProperties = {
@@ -106,15 +116,6 @@ const DAV_NAMESPACE = 'DAV:';
 const DEAD_PROPERTY_PREFIX = 'dead_property:';
 const LOCK_RECORDS_METADATA_KEY = 'lock_records';
 
-function escapeXml(value: string): string {
-	return value
-		.replaceAll('&', '&amp;')
-		.replaceAll('<', '&lt;')
-		.replaceAll('>', '&gt;')
-		.replaceAll('"', '&quot;')
-		.replaceAll("'", '&apos;');
-}
-
 function getResourceHref(key: string, isCollection: boolean): string {
 	const encodeHrefPath = (href: string): string => {
 		if (href === '/') {
@@ -165,11 +166,19 @@ async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Pr
 		return resource.customMetadata?.resourcetype === '<collection />';
 	}
 
-	let descendants = await bucket.list({
+	return hasCollectionDescendants(bucket, resourcePath);
+}
+
+async function hasCollectionDescendants(bucket: R2Bucket, resourcePath: string): Promise<boolean> {
+	const descendants = await bucket.list({
 		prefix: resourcePath + '/',
 		limit: 1,
 	});
 	return descendants.objects.length > 0;
+}
+
+function isBrowserWrite(request: Request): boolean {
+	return request.headers.get('X-WebDAV-UI') === '1';
 }
 
 function parseDestinationPath(destinationHeader: string, requestUrl: string): string | null {
@@ -546,17 +555,6 @@ function hasAlwaysFalseIfCondition(request: Request): boolean {
 	return ifHeader.includes('<DAV:no-lock>') && !ifHeader.includes('Not <DAV:no-lock>');
 }
 
-function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
-	if (left.byteLength !== right.byteLength) {
-		return false;
-	}
-	let mismatch = 0;
-	for (let index = 0; index < left.byteLength; index++) {
-		mismatch |= left[index] ^ right[index];
-	}
-	return mismatch === 0;
-}
-
 function extractLockOwner(body: string): string | undefined {
 	let owner = body.match(/<owner(?:\s[^>]*)?>([\s\S]*?)<\/owner>/i)?.[1];
 	if (owner === undefined) {
@@ -720,39 +718,47 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 }
 
 async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	const { pathname, searchParams } = new URL(request.url);
+	const resource_path = decodeResourcePath(pathname);
 
-	if (request.url.endsWith('/')) {
-		if (resource_path !== '') {
-			let resource = await bucket.head(resource_path);
-			if (resource === null || resource.customMetadata?.resourcetype !== '<collection />') {
+	if (pathname.endsWith('/')) {
+		const prefix = resource_path === '' ? '' : `${resource_path}/`;
+		let foundEntries = false;
+		const folders = new Map<string, BrowserEntry>();
+		const files: BrowserEntry[] = [];
+		const foldersOnly = searchParams.get('view') === 'folders';
+		const addFolderLink = (key: string) => {
+			const folder = key.endsWith('/') ? key.slice(0, -1) : key;
+			folders.set(folder, { name: folder.slice(prefix.length), href: getResourceHref(folder, true), kind: 'folder' });
+		};
+
+		for await (const result of listPages(bucket, prefix, '/')) {
+			foundEntries ||= result.objects.length > 0 || result.delimitedPrefixes.length > 0;
+			for (const object of result.objects) {
+				if (object.key === prefix) continue;
+				if (object.key.endsWith('/') || object.customMetadata?.resourcetype === '<collection />') {
+					addFolderLink(object.key);
+				} else if (!foldersOnly) {
+					files.push({
+						name: object.key.slice(prefix.length),
+						href: getResourceHref(object.key, false),
+						kind: 'file',
+						size: object.size,
+						modified: object.uploaded.toISOString(),
+					});
+				}
+			}
+			for (const folder of result.delimitedPrefixes) addFolderLink(folder);
+		}
+
+		if (prefix && !foundEntries) {
+			const marker = await bucket.head(resource_path);
+			if (marker?.customMetadata?.resourcetype !== '<collection />') {
 				return new Response('Not Found', { status: 404 });
 			}
 		}
-
-		let page = '',
-			prefix = resource_path;
-		if (resource_path !== '') {
-			page += `<a href="../">..</a><br>`;
-			prefix = `${resource_path}/`;
-		}
-
-		for await (const object of listAll(bucket, prefix)) {
-			if (object.key === resource_path) {
-				continue;
-			}
-			let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
-			page += `<a href="${escapeXml(href)}">${escapeXml(
-				object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length),
-			)}</a><br>`;
-		}
-		// 定义模板
-		var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`;
-
-		return new Response(pageSource, {
-			status: 200,
-			headers: { 'Content-Type': 'text/html; charset=utf-8' },
-		});
+		if (foldersOnly) return Response.json([...folders.values()]);
+		return renderBrowserPage(resource_path, [...folders.values(), ...files], getResourceHref);
 	} else {
 		let object = await bucket.get(resource_path, {
 			onlyIf: request.headers,
@@ -774,18 +780,24 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
 			const rangeRequested = request.headers.has('Range') && object.range !== undefined;
+			const fileName = resource_path.split('/').at(-1) ?? 'download';
+			const encodedName = encodeURIComponent(fileName).replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16)}`);
+			const disposition =
+				searchParams.get('download') === '1'
+					? `attachment; filename="download"; filename*=UTF-8''${encodedName}`
+					: object.httpMetadata?.contentDisposition;
 			return new Response(object.body, {
 				status: rangeRequested ? 206 : 200,
 				headers: {
 					'Accept-Ranges': 'bytes',
+					ETag: object.httpEtag,
+					'Last-Modified': object.uploaded.toUTCString(),
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+					'Content-Security-Policy': "sandbox; default-src 'none'",
+					'X-Content-Type-Options': 'nosniff',
 					'Content-Length': contentLength.toString(),
 					...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
-					...(object.httpMetadata?.contentDisposition
-						? {
-								'Content-Disposition': object.httpMetadata.contentDisposition,
-							}
-						: {}),
+					...(disposition ? { 'Content-Disposition': disposition } : {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
 								'Content-Encoding': object.httpMetadata.contentEncoding,
@@ -816,14 +828,15 @@ function calcContentRange(object: R2ObjectBody) {
 	let rangeOffset = 0;
 	let rangeEnd = object.size - 1;
 	if (object.range) {
-		if ('suffix' in object.range) {
+		if ('suffix' in object.range && typeof object.range.suffix === 'number') {
 			// Case 3: {suffix: number}
-			rangeOffset = object.size - object.range.suffix;
+			rangeOffset = Math.max(0, object.size - object.range.suffix);
 		} else {
 			// Case 1: {offset: number, length?: number}
 			// Case 2: {offset?: number, length: number}
-			rangeOffset = object.range.offset ?? 0;
-			let length = object.range.length ?? object.size - rangeOffset;
+			rangeOffset = 'offset' in object.range ? (object.range.offset ?? 0) : 0;
+			let length =
+				'length' in object.range ? (object.range.length ?? object.size - rangeOffset) : object.size - rangeOffset;
 			rangeEnd = Math.min(rangeOffset + length - 1, object.size - 1);
 		}
 	}
@@ -841,6 +854,13 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		return lockResponse;
 	}
 	let existing = await bucket.head(resource_path);
+	if (
+		isBrowserWrite(request) &&
+		(existing?.customMetadata?.resourcetype === '<collection />' ||
+			(existing === null && (await hasCollectionDescendants(bucket, resource_path))))
+	) {
+		return new Response('Collection exists at this path', { status: 409 });
+	}
 
 	// Check if the parent directory exists
 	let dirpath = getParentPath(resource_path);
@@ -848,17 +868,20 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		return new Response('Conflict', { status: 409 });
 	}
 
-	let body = await request.arrayBuffer();
-	await bucket.put(resource_path, body, {
+	const stored = await bucket.put(resource_path, request.body, {
 		onlyIf: request.headers,
 		httpMetadata: request.headers,
 		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
 	});
-	return existing === null ? new Response('', { status: 201 }) : new Response(null, { status: 204 });
+	if (stored === null) return new Response('Precondition Failed', { status: 412 });
+	return new Response(null, { status: existing === null ? 201 : 204, headers: { ETag: stored.httpEtag } });
 }
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
+	if (isBrowserWrite(request) && resource_path === '') {
+		return new Response('Method Not Allowed', { status: 405 });
+	}
 	let lockResponse = await assertRecursiveDeletePermission(request, bucket, resource_path);
 	if (lockResponse !== null) {
 		return lockResponse;
@@ -890,6 +913,7 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		await bucket.delete(resource_path);
 		return new Response(null, { status: 204 });
 	}
+	if (isBrowserWrite(request)) return new Response('Expected a file', { status: 409 });
 
 	let r2_objects,
 		cursor: string | undefined = undefined;
@@ -928,6 +952,10 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	if (resource !== null) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
+	const fromBrowser = isBrowserWrite(request);
+	if (fromBrowser && (resource_path === '' || (await hasCollectionDescendants(bucket, resource_path)))) {
+		return new Response('Collection exists at this path', { status: 409 });
+	}
 
 	// Check if the parent directory exists
 	let parent_dir = getParentPath(resource_path);
@@ -935,10 +963,12 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 		return new Response('Conflict', { status: 409 });
 	}
 
-	await bucket.put(resource_path, new Uint8Array(), {
+	const stored = await bucket.put(resource_path, new Uint8Array(), {
+		onlyIf: fromBrowser ? { etagDoesNotMatch: '*' } : undefined,
 		httpMetadata: request.headers,
 		customMetadata: { resourcetype: '<collection />' },
 	});
+	if (stored === null) return new Response('Precondition Failed', { status: 412 });
 	return new Response('', { status: 201 });
 }
 
@@ -1180,6 +1210,9 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	if (dont_overwrite && destination_exists) {
 		return new Response('Precondition Failed', { status: 412 });
 	}
+	if (isBrowserWrite(request) && !destination_exists && (await hasCollectionDescendants(bucket, destination))) {
+		return new Response('Collection exists at this path', { status: 409 });
+	}
 
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
@@ -1187,6 +1220,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
+	if (is_dir && isBrowserWrite(request)) return new Response('Expected a file', { status: 409 });
 
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
@@ -1197,18 +1231,15 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 					let target = destination + '/' + object.key.slice(prefix.length);
 					target = target.endsWith('/') ? target.slice(0, -1) : target;
 					let src = await bucket.get(object.key);
-					if (src !== null) {
-						await bucket.put(target, src.body, {
-							httpMetadata: object.httpMetadata,
-							customMetadata: stripLockMetadata(object.customMetadata),
-						});
-					}
+					if (src === null) throw new Error('Source disappeared during copy');
+					const stored = await bucket.put(target, src.body, {
+						httpMetadata: object.httpMetadata,
+						customMetadata: stripLockMetadata(object.customMetadata),
+					});
+					if (stored === null) throw new Error('Copy write failed');
 				};
-				let promise_array = [copy(resource)];
-				for await (let object of listAll(bucket, prefix, true)) {
-					promise_array.push(copy(object));
-				}
-				await Promise.all(promise_array);
+				await copy(resource);
+				await forEachBatched(listAll(bucket, prefix, true), copy);
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
@@ -1239,10 +1270,12 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
 		}
-		await bucket.put(destination, src.body, {
+		const stored = await bucket.put(destination, src.body, {
+			onlyIf: dont_overwrite ? { etagDoesNotMatch: '*' } : undefined,
 			httpMetadata: src.httpMetadata,
 			customMetadata: stripLockMetadata(src.customMetadata),
 		});
+		if (stored === null) return new Response('Precondition Failed', { status: 412 });
 		if (destination_exists) {
 			return new Response(null, { status: 204 });
 		} else {
@@ -1285,6 +1318,9 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	if (!overwrite && destination_exists) {
 		return new Response('Precondition Failed', { status: 412 });
 	}
+	if (isBrowserWrite(request) && !destination_exists && (await hasCollectionDescendants(bucket, destination))) {
+		return new Response('Collection exists at this path', { status: 409 });
+	}
 
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
@@ -1293,6 +1329,8 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	if (resource.key === destination) {
 		return new Response('Bad Request', { status: 400 });
 	}
+	let is_dir = resource.customMetadata?.resourcetype === '<collection />';
+	if (is_dir && isBrowserWrite(request)) return new Response('Expected a file', { status: 409 });
 
 	if (destination_exists) {
 		// Delete the destination first
@@ -1315,8 +1353,6 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		}
 	}
 
-	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
-
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
@@ -1326,19 +1362,17 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 					let target = destination + '/' + object.key.slice(prefix.length);
 					target = target.endsWith('/') ? target.slice(0, -1) : target;
 					let src = await bucket.get(object.key);
-					if (src !== null) {
-						await bucket.put(target, src.body, {
-							httpMetadata: object.httpMetadata,
-							customMetadata: getPreservedCustomMetadata(object.customMetadata),
-						});
-						await bucket.delete(object.key);
-					}
+					if (src === null) throw new Error('Source disappeared during move');
+					const stored = await bucket.put(target, src.body, {
+						httpMetadata: object.httpMetadata,
+						customMetadata: getPreservedCustomMetadata(object.customMetadata),
+					});
+					if (stored === null) throw new Error('Move write failed');
+					await bucket.delete(object.key);
 				};
-				let promise_array = [move(resource)];
-				for await (let object of listAll(bucket, prefix, true)) {
-					promise_array.push(move(object));
-				}
-				await Promise.all(promise_array);
+				await forEachBatched(listAll(bucket, prefix, true), move);
+				// Keep the source collection marker until all its children have moved.
+				await move(resource);
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
@@ -1354,10 +1388,12 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
 		}
-		await bucket.put(destination, src.body, {
+		const stored = await bucket.put(destination, src.body, {
+			onlyIf: overwrite ? undefined : { etagDoesNotMatch: '*' },
 			httpMetadata: src.httpMetadata,
 			customMetadata: getPreservedCustomMetadata(src.customMetadata),
 		});
+		if (stored === null) return new Response('Precondition Failed', { status: 412 });
 		await bucket.delete(resource.key);
 		if (destination_exists) {
 			return new Response(null, { status: 204 });
@@ -1595,10 +1631,10 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 function is_authorized(authorization_header: string, username: string, password: string): boolean {
-	const encoder = new TextEncoder();
-
-	const header = encoder.encode(authorization_header);
-	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+	const header = createHash('sha256').update(authorization_header).digest();
+	const expected = createHash('sha256')
+		.update(`Basic ${btoa(`${username}:${password}`)}`)
+		.digest();
 
 	return timingSafeEqual(header, expected);
 }
@@ -1606,6 +1642,14 @@ function is_authorized(authorization_header: string, username: string, password:
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
+		if (!env.USERNAME || !env.PASSWORD) return new Response('Service not configured', { status: 503 });
+		const url = new URL(request.url);
+		if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname)) {
+			return new Response('HTTPS required', { status: 426 });
+		}
+		if (isBrowserWrite(request) && request.headers.get('Origin') !== url.origin) {
+			return new Response('Forbidden', { status: 403 });
+		}
 
 		if (
 			request.method !== 'OPTIONS' &&
@@ -1619,7 +1663,15 @@ export default {
 			});
 		}
 
-		let response: Response = await dispatch_handler(request, bucket);
+		let response: Response;
+		try {
+			response = await dispatch_handler(request, bucket);
+		} catch {
+			// Do not include URLs, request headers, bodies, or exception messages in logs.
+			console.error(JSON.stringify({ event: 'webdav_error', method: request.method }));
+			response = new Response('Internal Server Error', { status: 500 });
+		}
+		response.headers.set('Cache-Control', 'no-store');
 
 		// Set CORS headers
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
@@ -1657,4 +1709,4 @@ export default {
 
 		return response;
 	},
-};
+} satisfies ExportedHandler<Env>;
